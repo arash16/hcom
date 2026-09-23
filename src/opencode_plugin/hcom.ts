@@ -661,10 +661,13 @@ type V2Draft = {
   messages?: { id?: string; role: string; content: V2TextPart[] }[]
 }
 type V2Registration = { dispose: () => Promise<void> }
+type V2Model = { providerID: string; id: string; variant?: string }
 type V2Context = {
   event: { subscribe: (options?: { signal?: AbortSignal }) => AsyncIterable<V2Event> }
+  agent: { transform: (edit: (editor: { default: (id: string) => void }) => void) => Promise<V2Registration> }
   session: {
     prompt: (input: { sessionID: string; text: string; delivery?: "steer" | "queue" }) => Promise<unknown>
+    switchModel: (input: { sessionID: string; model: V2Model }) => Promise<unknown>
     hook: (name: string, callback: (draft: any) => Promise<void> | void) => Promise<V2Registration>
   }
 }
@@ -690,6 +693,14 @@ function v1Event({ type, data }: V2Event): HcomEvent | null {
       return { type, properties: data } as any
   }
   return null
+}
+
+// `provider/model[#variant]`, the form `opencode --model` took.
+function parseLaunchModel(raw: string | undefined): V2Model | undefined {
+  const [ref, variant] = (raw ?? "").split("#")
+  const slash = ref.indexOf("/")
+  if (slash <= 0 || slash === ref.length - 1) return undefined
+  return { providerID: ref.slice(0, slash), id: ref.slice(slash + 1), ...(variant ? { variant } : {}) }
 }
 
 async function setupOpenCode2(ctx: V2Context) {
@@ -727,9 +738,24 @@ async function setupOpenCode2(ctx: V2Context) {
     await Promise.all(registrations.map((r) => r.dispose()))
     await hooks.dispose()
   }
+  // `hcom opencode --agent/--model`, moved to env by the launcher: OpenCode 2's TUI
+  // has no such flags. The agent becomes the server default. The model is switched
+  // on each session's first prompt, before its turn runs: agent files override any
+  // default model set here, since OpenCode applies them after this plugin's setup.
+  const launchAgent = process.env.HCOM_OPENCODE_AGENT
+  const launchModel = parseLaunchModel(process.env.HCOM_OPENCODE_MODEL)
+  const modelSwitched = new Set<string>()
+  async function onPrompt(draft: { sessionID: string }) {
+    if (launchModel && !modelSwitched.has(draft.sessionID)) {
+      modelSwitched.add(draft.sessionID)
+      await ctx.session.switchModel({ sessionID: draft.sessionID, model: launchModel })
+    }
+    await hooks["chat.message"]({ sessionID: draft.sessionID }, {})
+  }
+
   try {
-    registrations.push(await ctx.session.hook("prompt", (draft: { sessionID: string }) =>
-      hooks["chat.message"]({ sessionID: draft.sessionID }, {})))
+    if (launchAgent) registrations.push(await ctx.agent.transform((editor) => editor.default(launchAgent)))
+    registrations.push(await ctx.session.hook("prompt", onPrompt))
     registrations.push(await ctx.session.hook("context", transform))
     registrations.push(await ctx.session.hook("compaction", async (draft: V2Draft) => {
       const output = { context: [] as string[] }

@@ -2365,6 +2365,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                     let effective_args = if normalized == LaunchTool::OpenCode {
                         opencode_preprocessing::preprocess_opencode_args(
                             &params.args,
+                            &mut instance_env,
                             std::path::Path::new(working_dir),
                         )?
                     } else {

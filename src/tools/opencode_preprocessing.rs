@@ -12,6 +12,12 @@ const STANDALONE_FLAG: &str = "--standalone";
 /// OpenCode 2's TUI has no `--fork`; the fork happens server-side instead.
 const FORK_FLAG: &str = "--fork";
 const SESSION_FLAG: &str = "--session";
+/// OpenCode 2's TUI has no `--agent`/`--model`; the plugin applies them as the
+/// server's defaults from these env vars.
+const AGENT_FLAGS: &[&str] = &["--agent"];
+const MODEL_FLAGS: &[&str] = &["--model", "-m"];
+const AGENT_ENV: &str = "HCOM_OPENCODE_AGENT";
+const MODEL_ENV: &str = "HCOM_OPENCODE_MODEL";
 const OPENCODE_2_MAJOR: u64 = 2;
 
 fn opencode_permission_json() -> String {
@@ -49,14 +55,45 @@ pub fn preprocess_opencode_env(
     env.insert("HCOM_NAME".to_string(), instance_name.to_string());
 }
 
-/// Preprocess OpenCode launch args for OpenCode 2+: fork a `--session <id> --fork`
-/// through the server API, then add `--standalone`.
-pub fn preprocess_opencode_args(args: &[String], cwd: &Path) -> Result<Vec<String>> {
+/// Preprocess OpenCode launch args for OpenCode 2+: move `--agent`/`--model` into
+/// `env`, fork a `--session <id> --fork` through the server API, then add `--standalone`.
+pub fn preprocess_opencode_args(
+    args: &[String],
+    env: &mut HashMap<String, String>,
+    cwd: &Path,
+) -> Result<Vec<String>> {
     if !is_opencode_2() {
         return Ok(args.to_vec());
     }
-    let args = fork_session_server_side(args, |id| fork_session(id, cwd))?;
+    let (args, agent) = take_value_arg(args, AGENT_FLAGS);
+    let (args, model) = take_value_arg(&args, MODEL_FLAGS);
+    for (key, value) in [(AGENT_ENV, agent), (MODEL_ENV, model)] {
+        if let Some(value) = value {
+            env.insert(key.to_string(), value);
+        }
+    }
+    let args = fork_session_server_side(&args, |id| fork_session(id, cwd))?;
     Ok(add_standalone(&args))
+}
+
+/// Removes every `--flag value` / `--flag=value` for `flags`; returns the last value.
+fn take_value_arg(args: &[String], flags: &[&str]) -> (Vec<String>, Option<String>) {
+    let mut kept = Vec::with_capacity(args.len());
+    let mut value = None;
+    let mut tokens = args.iter();
+    while let Some(token) = tokens.next() {
+        if flags.contains(&token.as_str()) {
+            value = tokens.next().cloned().or(value);
+        } else if let Some(inline) = flags
+            .iter()
+            .find_map(|flag| token.strip_prefix(&format!("{flag}=")))
+        {
+            value = Some(inline.to_string());
+        } else {
+            kept.push(token.clone());
+        }
+    }
+    (kept, value)
 }
 
 /// Leaves the args alone when the user already chose a server.
@@ -216,6 +253,22 @@ mod tests {
         ] {
             assert_eq!(add_standalone(&args), args);
         }
+    }
+
+    #[test]
+    fn test_take_value_arg_removes_both_forms() {
+        let args = strings(&["--agent", "qa", "--session", "ses_src", "-m=google/x"]);
+        let (rest, agent) = take_value_arg(&args, AGENT_FLAGS);
+        assert_eq!(agent.as_deref(), Some("qa"));
+        let (rest, model) = take_value_arg(&rest, MODEL_FLAGS);
+        assert_eq!(model.as_deref(), Some("google/x"));
+        assert_eq!(rest, ["--session", "ses_src"]);
+    }
+
+    #[test]
+    fn test_take_value_arg_absent() {
+        let args = strings(&["--session", "ses_src"]);
+        assert_eq!(take_value_arg(&args, AGENT_FLAGS), (args.clone(), None));
     }
 
     #[test]
