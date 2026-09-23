@@ -1,13 +1,18 @@
 //! OpenCode launch preprocessing — sets environment variables for hcom integration.
 //! Plugin management is handled separately in hooks/opencode.rs.
 
+use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::OnceLock;
 
 /// OpenCode 2 hosts plugins in a shared background service that never sees
 /// hcom's launch env; `--standalone` runs a private server per launch instead.
 const STANDALONE_FLAG: &str = "--standalone";
-const STANDALONE_MIN_MAJOR: u64 = 2;
+/// OpenCode 2's TUI has no `--fork`; the fork happens server-side instead.
+const FORK_FLAG: &str = "--fork";
+const SESSION_FLAG: &str = "--session";
+const OPENCODE_2_MAJOR: u64 = 2;
 
 fn opencode_permission_json() -> String {
     let prefix = crate::runtime_env::build_hcom_command();
@@ -44,21 +49,69 @@ pub fn preprocess_opencode_env(
     env.insert("HCOM_NAME".to_string(), instance_name.to_string());
 }
 
-/// Preprocess OpenCode launch args: add `--standalone` on OpenCode 2+.
-pub fn preprocess_opencode_args(args: &[String]) -> Vec<String> {
-    add_standalone(args, opencode_supports_standalone())
+/// Preprocess OpenCode launch args for OpenCode 2+: fork a `--session <id> --fork`
+/// through the server API, then add `--standalone`.
+pub fn preprocess_opencode_args(args: &[String], cwd: &Path) -> Result<Vec<String>> {
+    if !is_opencode_2() {
+        return Ok(args.to_vec());
+    }
+    let args = fork_session_server_side(args, |id| fork_session(id, cwd))?;
+    Ok(add_standalone(&args))
 }
 
 /// Leaves the args alone when the user already chose a server.
-fn add_standalone(args: &[String], supported: bool) -> Vec<String> {
+fn add_standalone(args: &[String]) -> Vec<String> {
     let chosen = args
         .iter()
         .any(|arg| arg == STANDALONE_FLAG || arg == "--server" || arg.starts_with("--server="));
     let mut result = args.to_vec();
-    if supported && !chosen {
+    if !chosen {
         result.insert(0, STANDALONE_FLAG.to_string());
     }
     result
+}
+
+/// Replaces `--session <id> --fork` with `--session <fork of id>`.
+fn fork_session_server_side(
+    args: &[String],
+    fork: impl FnOnce(&str) -> Result<String>,
+) -> Result<Vec<String>> {
+    let Some(fork_at) = args.iter().position(|arg| arg == FORK_FLAG) else {
+        return Ok(args.to_vec());
+    };
+    let Some(session_at) = args.iter().position(|arg| arg == SESSION_FLAG) else {
+        bail!("{FORK_FLAG} needs {SESSION_FLAG} <id>");
+    };
+    let source = args
+        .get(session_at + 1)
+        .with_context(|| format!("{SESSION_FLAG} needs a session id"))?;
+    let forked = fork(source)?;
+    let mut result = args.to_vec();
+    result[session_at + 1] = forked;
+    result.remove(fork_at);
+    Ok(result)
+}
+
+fn fork_session(session_id: &str, cwd: &Path) -> Result<String> {
+    let output = crate::terminal::executable_command("opencode")
+        .args(["api", STANDALONE_FLAG, "POST"])
+        .arg(format!("/api/session/{session_id}/fork"))
+        .args(["--data", "{}"])
+        .current_dir(cwd)
+        .output()
+        .context("could not run opencode api to fork the session")?;
+    if !output.status.success() {
+        bail!(
+            "opencode could not fork session {session_id}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let response: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("opencode fork response is not JSON")?;
+    response["data"]["id"]
+        .as_str()
+        .map(str::to_string)
+        .with_context(|| format!("opencode fork response has no session id: {response}"))
 }
 
 fn parse_opencode_major_version(output: &str) -> Option<u64> {
@@ -68,7 +121,7 @@ fn parse_opencode_major_version(output: &str) -> Option<u64> {
         .and_then(|token| token.split('.').next()?.parse().ok())
 }
 
-fn opencode_supports_standalone() -> bool {
+fn is_opencode_2() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| {
         let output = match crate::terminal::executable_command("opencode")
@@ -80,13 +133,13 @@ fn opencode_supports_standalone() -> bool {
                 crate::log::log_warn(
                     "opencode",
                     "opencode.version_failed",
-                    &format!("could not run opencode --version; skipping {STANDALONE_FLAG}: {e}"),
+                    &format!("could not run opencode --version; assuming OpenCode 1: {e}"),
                 );
                 return false;
             }
         };
         parse_opencode_major_version(&String::from_utf8_lossy(&output.stdout))
-            .is_some_and(|major| major >= STANDALONE_MIN_MAJOR)
+            .is_some_and(|major| major >= OPENCODE_2_MAJOR)
     })
 }
 
@@ -142,25 +195,55 @@ mod tests {
         assert_eq!(parse_opencode_major_version("opencode"), None);
     }
 
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| arg.to_string()).collect()
+    }
+
     #[test]
-    fn test_add_standalone_when_supported() {
-        let args = vec!["--model".to_string(), "a/b".to_string()];
+    fn test_add_standalone() {
         assert_eq!(
-            add_standalone(&args, true),
+            add_standalone(&strings(&["--model", "a/b"])),
             ["--standalone", "--model", "a/b"]
         );
-        assert_eq!(add_standalone(&args, false), args);
     }
 
     #[test]
     fn test_add_standalone_respects_chosen_server() {
         for args in [
-            vec!["--standalone".to_string()],
-            vec!["--server".to_string(), "http://x".to_string()],
-            vec!["--server=http://x".to_string()],
+            strings(&["--standalone"]),
+            strings(&["--server", "http://x"]),
+            strings(&["--server=http://x"]),
         ] {
-            assert_eq!(add_standalone(&args, true), args);
+            assert_eq!(add_standalone(&args), args);
         }
+    }
+
+    #[test]
+    fn test_fork_session_server_side_continues_the_fork() {
+        let args = strings(&["--model", "a/b", "--session", "ses_src", "--fork"]);
+        let forked = fork_session_server_side(&args, |id| {
+            assert_eq!(id, "ses_src");
+            Ok("ses_copy".to_string())
+        })
+        .unwrap();
+        assert_eq!(forked, ["--model", "a/b", "--session", "ses_copy"]);
+    }
+
+    #[test]
+    fn test_fork_session_server_side_leaves_plain_resume() {
+        let args = strings(&["--session", "ses_src"]);
+        let resumed = fork_session_server_side(&args, |_| panic!("no fork requested")).unwrap();
+        assert_eq!(resumed, args);
+    }
+
+    #[test]
+    fn test_fork_session_server_side_needs_a_session() {
+        assert!(fork_session_server_side(&strings(&["--fork"]), |_| unreachable!()).is_err());
+        let failed =
+            fork_session_server_side(&strings(&["--session", "ses_src", "--fork"]), |_| {
+                bail!("server down")
+            });
+        assert!(failed.is_err());
     }
 
     #[test]

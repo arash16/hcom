@@ -2363,7 +2363,10 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         hcom_config.auto_approve,
                     );
                     let effective_args = if normalized == LaunchTool::OpenCode {
-                        opencode_preprocessing::preprocess_opencode_args(&params.args)
+                        opencode_preprocessing::preprocess_opencode_args(
+                            &params.args,
+                            std::path::Path::new(working_dir),
+                        )?
                     } else {
                         params.args.clone()
                     };
