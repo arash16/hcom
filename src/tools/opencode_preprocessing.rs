@@ -72,7 +72,8 @@ pub fn preprocess_opencode_args(
             env.insert(key.to_string(), value);
         }
     }
-    let args = fork_session_server_side(&args, |id| fork_session(id, cwd))?;
+    let server = chosen_server(&args).unwrap_or_else(|| vec![STANDALONE_FLAG.to_string()]);
+    let args = fork_session_server_side(&args, |id| fork_session(id, &server, cwd))?;
     Ok(add_standalone(&args))
 }
 
@@ -96,13 +97,23 @@ fn take_value_arg(args: &[String], flags: &[&str]) -> (Vec<String>, Option<Strin
     (kept, value)
 }
 
+/// The server flags the user chose (`--standalone`, `--server <url>`), if any.
+fn chosen_server(args: &[String]) -> Option<Vec<String>> {
+    args.iter().enumerate().find_map(|(at, arg)| {
+        if arg == STANDALONE_FLAG || arg.starts_with("--server=") {
+            Some(vec![arg.clone()])
+        } else if arg == "--server" {
+            Some(args[at..].iter().take(2).cloned().collect())
+        } else {
+            None
+        }
+    })
+}
+
 /// Leaves the args alone when the user already chose a server.
 fn add_standalone(args: &[String]) -> Vec<String> {
-    let chosen = args
-        .iter()
-        .any(|arg| arg == STANDALONE_FLAG || arg == "--server" || arg.starts_with("--server="));
     let mut result = args.to_vec();
-    if !chosen {
+    if chosen_server(args).is_none() {
         result.insert(0, STANDALONE_FLAG.to_string());
     }
     result
@@ -129,9 +140,12 @@ fn fork_session_server_side(
     Ok(result)
 }
 
-fn fork_session(session_id: &str, cwd: &Path) -> Result<String> {
+/// Forks on `server`, the one the launched TUI connects to.
+fn fork_session(session_id: &str, server: &[String], cwd: &Path) -> Result<String> {
     let output = crate::terminal::executable_command("opencode")
-        .args(["api", STANDALONE_FLAG, "POST"])
+        .arg("api")
+        .args(server)
+        .arg("POST")
         .arg(format!("/api/session/{session_id}/fork"))
         .args(["--data", "{}"])
         .current_dir(cwd)
@@ -269,6 +283,23 @@ mod tests {
     fn test_take_value_arg_absent() {
         let args = strings(&["--session", "ses_src"]);
         assert_eq!(take_value_arg(&args, AGENT_FLAGS), (args.clone(), None));
+    }
+
+    #[test]
+    fn test_chosen_server() {
+        assert_eq!(chosen_server(&strings(&["--model", "a/b"])), None);
+        assert_eq!(
+            chosen_server(&strings(&["--session", "s", "--server", "http://x"])),
+            Some(strings(&["--server", "http://x"]))
+        );
+        assert_eq!(
+            chosen_server(&strings(&["--server=http://x"])),
+            Some(strings(&["--server=http://x"]))
+        );
+        assert_eq!(
+            chosen_server(&strings(&["--standalone"])),
+            Some(strings(&["--standalone"]))
+        );
     }
 
     #[test]

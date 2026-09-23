@@ -121,6 +121,7 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
   let deliveryPending = false                   // Wake arrived while delivery was already in flight
   let deliveryRetryScheduled = false            // Avoid duplicate queued retry passes
   let permissionPending = false                  // Exact permission gate from OpenCode events
+  let disposed = false                           // Plugin unloaded: its OpenCode client must not be called
   let launchedAgent: string | null = parseCliArgValue("--agent")
   let launchedModel: PromptModel | null = parseCliModelArg()
   let currentAgent: string | null = launchedAgent
@@ -203,6 +204,7 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
   //     injection was pending ack. drainPendingDelivery replays it at each exit
   //     point: normal finally, deferred ack, and promptAsync rejection.
   async function deliverPendingToIdle(sid: string): Promise<boolean> {
+    if (disposed) return false
     if (permissionPending) {
       log("DEBUG", "plugin.delivery_skipped", instanceName, { reason: "permission_pending" })
       return false
@@ -224,6 +226,8 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
     deliveryInFlight = true
     try {
       const msgResult = await $.nothrow()`hcom opencode-read --name ${instanceName}`.quiet()
+      // Unacked messages stay unread, so the next plugin instance delivers them.
+      if (disposed) return false
       if (msgResult.exitCode !== 0) {
         log("WARN", "plugin.delivery_read_failed", instanceName, { exit_code: msgResult.exitCode, stderr: msgResult.stderr.toString().slice(0, 200) })
         return false
@@ -644,6 +648,7 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
     // Plugin unload, not session end: the hcom instance stays bound, since a
     // reloaded plugin rebinds the same session.
     dispose: async () => {
+      disposed = true
       stopNotifyServer()
       stopReconcileTimer()
     },
@@ -735,8 +740,11 @@ async function setupOpenCode2(ctx: V2Context) {
 
   const registrations: V2Registration[] = []
   const disposeAll = async () => {
-    await Promise.all(registrations.map((r) => r.dispose()))
-    await hooks.dispose()
+    try {
+      await Promise.all(registrations.map((r) => r.dispose()))
+    } finally {
+      await hooks.dispose()
+    }
   }
   // `hcom opencode --agent/--model`, moved to env by the launcher: OpenCode 2's TUI
   // has no such flags. The agent becomes the server default. The model is switched
@@ -763,7 +771,7 @@ async function setupOpenCode2(ctx: V2Context) {
       for (const text of output.context) draft.system.push({ type: "text", text })
     }))
   } catch (e) {
-    await disposeAll()
+    await disposeAll().catch(() => {}) // the registration error is the one to report
     throw e
   }
 
