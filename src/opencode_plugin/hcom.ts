@@ -640,6 +640,13 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
         log("ERROR", "plugin.compaction_error", instanceName, { error: String(e) })
       }
     },
+
+    // Plugin unload, not session end: the hcom instance stays bound, since a
+    // reloaded plugin rebinds the same session.
+    dispose: async () => {
+      stopNotifyServer()
+      stopReconcileTimer()
+    },
   }
 }
 
@@ -715,16 +722,24 @@ async function setupOpenCode2(ctx: V2Context) {
     }
   }
 
-  const registrations = await Promise.all([
-    ctx.session.hook("prompt", (draft: { sessionID: string }) =>
-      hooks["chat.message"]({ sessionID: draft.sessionID }, {})),
-    ctx.session.hook("context", transform),
-    ctx.session.hook("compaction", async (draft: V2Draft) => {
+  const registrations: V2Registration[] = []
+  const disposeAll = async () => {
+    await Promise.all(registrations.map((r) => r.dispose()))
+    await hooks.dispose()
+  }
+  try {
+    registrations.push(await ctx.session.hook("prompt", (draft: { sessionID: string }) =>
+      hooks["chat.message"]({ sessionID: draft.sessionID }, {})))
+    registrations.push(await ctx.session.hook("context", transform))
+    registrations.push(await ctx.session.hook("compaction", async (draft: V2Draft) => {
       const output = { context: [] as string[] }
       await hooks["experimental.session.compacting"]({ sessionID: draft.sessionID }, output)
       for (const text of output.context) draft.system.push({ type: "text", text })
-    }),
-  ])
+    }))
+  } catch (e) {
+    await disposeAll()
+    throw e
+  }
 
   const controller = new AbortController()
   const consuming = (async () => {
@@ -740,8 +755,8 @@ async function setupOpenCode2(ctx: V2Context) {
 
   return async () => {
     controller.abort()
-    await Promise.all(registrations.map((r) => r.dispose()))
     await consuming
+    await disposeAll()
   }
 }
 
