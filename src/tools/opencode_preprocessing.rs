@@ -65,8 +65,12 @@ pub fn preprocess_opencode_args(
     if !is_opencode_2() {
         return Ok(args.to_vec());
     }
-    let (args, agent) = take_value_arg(args, AGENT_FLAGS);
-    let (args, model) = take_value_arg(&args, MODEL_FLAGS);
+    let (args, agent) = take_value_arg(args, AGENT_FLAGS)?;
+    let (args, model) = take_value_arg(&args, MODEL_FLAGS)?;
+    let remote = chosen_server(&args).is_some_and(|server| server[0] != STANDALONE_FLAG);
+    if remote && (agent.is_some() || model.is_some()) {
+        bail!("--agent/--model cannot reach a server chosen with --server on OpenCode 2");
+    }
     for (key, value) in [(AGENT_ENV, agent), (MODEL_ENV, model)] {
         if let Some(value) = value {
             env.insert(key.to_string(), value);
@@ -78,13 +82,16 @@ pub fn preprocess_opencode_args(
 }
 
 /// Removes every `--flag value` / `--flag=value` for `flags`; returns the last value.
-fn take_value_arg(args: &[String], flags: &[&str]) -> (Vec<String>, Option<String>) {
+fn take_value_arg(args: &[String], flags: &[&str]) -> Result<(Vec<String>, Option<String>)> {
     let mut kept = Vec::with_capacity(args.len());
     let mut value = None;
-    let mut tokens = args.iter();
+    let mut tokens = args.iter().peekable();
     while let Some(token) = tokens.next() {
         if flags.contains(&token.as_str()) {
-            value = tokens.next().cloned().or(value);
+            let Some(next) = tokens.next_if(|next| !next.starts_with('-')) else {
+                bail!("{token} needs a value");
+            };
+            value = Some(next.clone());
         } else if let Some(inline) = flags
             .iter()
             .find_map(|flag| token.strip_prefix(&format!("{flag}=")))
@@ -94,7 +101,7 @@ fn take_value_arg(args: &[String], flags: &[&str]) -> (Vec<String>, Option<Strin
             kept.push(token.clone());
         }
     }
-    (kept, value)
+    Ok((kept, value))
 }
 
 /// The server flags the user chose (`--standalone`, `--server <url>`), if any.
@@ -272,9 +279,9 @@ mod tests {
     #[test]
     fn test_take_value_arg_removes_both_forms() {
         let args = strings(&["--agent", "qa", "--session", "ses_src", "-m=google/x"]);
-        let (rest, agent) = take_value_arg(&args, AGENT_FLAGS);
+        let (rest, agent) = take_value_arg(&args, AGENT_FLAGS).unwrap();
         assert_eq!(agent.as_deref(), Some("qa"));
-        let (rest, model) = take_value_arg(&rest, MODEL_FLAGS);
+        let (rest, model) = take_value_arg(&rest, MODEL_FLAGS).unwrap();
         assert_eq!(model.as_deref(), Some("google/x"));
         assert_eq!(rest, ["--session", "ses_src"]);
     }
@@ -282,7 +289,20 @@ mod tests {
     #[test]
     fn test_take_value_arg_absent() {
         let args = strings(&["--session", "ses_src"]);
-        assert_eq!(take_value_arg(&args, AGENT_FLAGS), (args.clone(), None));
+        assert_eq!(
+            take_value_arg(&args, AGENT_FLAGS).unwrap(),
+            (args.clone(), None)
+        );
+    }
+
+    #[test]
+    fn test_take_value_arg_rejects_missing_value() {
+        for args in [
+            strings(&["--model", "--session", "ses_src"]),
+            strings(&["--agent"]),
+        ] {
+            assert!(take_value_arg(&args, &["--model", "--agent"]).is_err());
+        }
     }
 
     #[test]

@@ -752,12 +752,20 @@ async function setupOpenCode2(ctx: V2Context) {
   // default model set here, since OpenCode applies them after this plugin's setup.
   const launchAgent = process.env.HCOM_OPENCODE_AGENT
   const launchModel = parseLaunchModel(process.env.HCOM_OPENCODE_MODEL)
-  const modelSwitched = new Set<string>()
-  async function onPrompt(draft: { sessionID: string }) {
-    if (launchModel && !modelSwitched.has(draft.sessionID)) {
-      modelSwitched.add(draft.sessionID)
-      await ctx.session.switchModel({ sessionID: draft.sessionID, model: launchModel })
+  // One switch per session, shared by concurrent first prompts; a failed switch
+  // is dropped so the next prompt retries it.
+  const modelSwitches = new Map<string, Promise<unknown>>()
+  function switchToLaunchModel(sessionID: string, model: V2Model) {
+    let pending = modelSwitches.get(sessionID)
+    if (!pending) {
+      pending = ctx.session.switchModel({ sessionID, model })
+      modelSwitches.set(sessionID, pending)
+      pending.catch(() => modelSwitches.delete(sessionID))
     }
+    return pending
+  }
+  async function onPrompt(draft: { sessionID: string }) {
+    if (launchModel) await switchToLaunchModel(draft.sessionID, launchModel)
     await hooks["chat.message"]({ sessionID: draft.sessionID }, {})
   }
 
