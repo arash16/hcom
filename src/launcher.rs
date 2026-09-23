@@ -2362,6 +2362,11 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         &instance_name,
                         hcom_config.auto_approve,
                     );
+                    let effective_args = if normalized == LaunchTool::OpenCode {
+                        opencode_preprocessing::preprocess_opencode_args(&params.args)
+                    } else {
+                        params.args.clone()
+                    };
 
                     instances::update_instance_position(
                         db,
@@ -2385,7 +2390,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                             handles: &mut handles,
                         },
                         &mut instance_env,
-                        &params.args,
+                        &effective_args,
                         &params,
                         inside_ai_tool,
                     )

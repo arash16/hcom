@@ -642,3 +642,113 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
     },
   }
 }
+
+// OpenCode 2 loads plugins from the module's default export and hands `setup`
+// a context with no v1 `client`/`$`. Typed structurally: the published
+// @opencode-ai/plugin types do not describe the v2 session and event domains.
+type V2Event = { type: string; data: Record<string, any> }
+type V2TextPart = { type: string; text?: string }
+type V2Draft = {
+  sessionID: string
+  system: V2TextPart[]
+  messages?: { id?: string; role: string; content: V2TextPart[] }[]
+}
+type V2Registration = { dispose: () => Promise<void> }
+type V2Context = {
+  event: { subscribe: (options?: { signal?: AbortSignal }) => AsyncIterable<V2Event> }
+  session: {
+    prompt: (input: { sessionID: string; text: string; delivery?: "steer" | "queue" }) => Promise<unknown>
+    hook: (name: string, callback: (draft: any) => Promise<void> | void) => Promise<V2Registration>
+  }
+}
+
+// Reshapes v2 events into the v1 events HcomPlugin handles. Execution events
+// carry the busy/idle edge; v2 has no `file.edited`.
+function v1Event({ type, data }: V2Event): HcomEvent | null {
+  switch (type) {
+    case "session.created":
+      return { type, properties: { info: { ...data, id: data.sessionID } } } as any
+    case "session.status":
+      return { type, properties: data } as any
+    case "session.execution.started":
+      return { type: "session.status", properties: { sessionID: data.sessionID, status: { type: "busy" } } } as any
+    case "session.execution.succeeded":
+    case "session.execution.failed":
+    case "session.execution.interrupted":
+      return { type: "session.status", properties: { sessionID: data.sessionID, status: { type: "idle" } } } as any
+    case "permission.asked":
+      return { type, properties: { id: data.id, sessionID: data.sessionID, permission: data.action } }
+    case "permission.replied":
+    case "session.deleted":
+      return { type, properties: data } as any
+  }
+  return null
+}
+
+async function setupOpenCode2(ctx: V2Context) {
+  const statusBySession: Record<string, { type: string }> = {}
+  const client = {
+    session: {
+      promptAsync: ({ path, body }: any) =>
+        ctx.session.prompt({
+          sessionID: path.id,
+          text: body.parts.map((p: V2TextPart) => p.text).join("\n"),
+          delivery: "queue",
+        }),
+      status: async () => ({ data: statusBySession }),
+    },
+  }
+  const hooks: any = await HcomPlugin({ client, $: Bun.$ } as unknown as PluginInput)
+
+  // The v1 transform reads user messages as { info, parts }. Sharing the part
+  // objects lets its in-place text rewrite reach the request; parts it appends
+  // (the bootstrap) go to the system prompt instead of the user message.
+  async function transform(draft: V2Draft) {
+    const views = (draft.messages ?? []).map((m) => ({
+      info: { id: m.id, role: m.role, sessionID: draft.sessionID },
+      parts: [...m.content],
+      added: m.content.length,
+    }))
+    await hooks["experimental.chat.messages.transform"]({}, { messages: views })
+    for (const view of views) {
+      for (const part of view.parts.slice(view.added)) draft.system.push({ type: "text", text: part.text })
+    }
+  }
+
+  const registrations = await Promise.all([
+    ctx.session.hook("prompt", (draft: { sessionID: string }) =>
+      hooks["chat.message"]({ sessionID: draft.sessionID }, {})),
+    ctx.session.hook("context", transform),
+    ctx.session.hook("compaction", async (draft: V2Draft) => {
+      const output = { context: [] as string[] }
+      await hooks["experimental.session.compacting"]({ sessionID: draft.sessionID }, output)
+      for (const text of output.context) draft.system.push({ type: "text", text })
+    }),
+  ])
+
+  const controller = new AbortController()
+  const consuming = (async () => {
+    for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+      const mapped: any = v1Event(event)
+      if (!mapped) continue
+      if (mapped.type === "session.status") statusBySession[mapped.properties.sessionID] = mapped.properties.status
+      await hooks.event({ event: mapped })
+    }
+  })().catch((e) => {
+    if (!controller.signal.aborted) log("ERROR", "plugin.event_subscription_failed", null, { error: String(e) })
+  })
+
+  return async () => {
+    controller.abort()
+    await Promise.all(registrations.map((r) => r.dispose()))
+    await consuming
+  }
+}
+
+// OpenCode 1 rejects a default export without `server`; pointing it at
+// HcomPlugin keeps a single instance under both loaders.
+export default {
+  id: "hcom",
+  server: HcomPlugin,
+  setup: setupOpenCode2,
+}
