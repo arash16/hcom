@@ -67,6 +67,9 @@ pub fn preprocess_opencode_args(
     }
     let (args, agent) = take_value_arg(args, AGENT_FLAGS)?;
     let (args, model) = take_value_arg(&args, MODEL_FLAGS)?;
+    if let Some(ref model) = model {
+        validate_model_arg(model)?;
+    }
     let remote = chosen_server(&args).is_some_and(|server| server[0] != STANDALONE_FLAG);
     if remote && (agent.is_some() || model.is_some()) {
         bail!("--agent/--model cannot reach a server chosen with --server on OpenCode 2");
@@ -91,17 +94,42 @@ fn take_value_arg(args: &[String], flags: &[&str]) -> Result<(Vec<String>, Optio
             let Some(next) = tokens.next_if(|next| !next.starts_with('-')) else {
                 bail!("{token} needs a value");
             };
+            if next.trim().is_empty() {
+                bail!("{token} needs a value");
+            }
             value = Some(next.clone());
         } else if let Some(inline) = flags
             .iter()
             .find_map(|flag| token.strip_prefix(&format!("{flag}=")))
         {
+            if inline.trim().is_empty() {
+                bail!("{token} needs a value");
+            }
             value = Some(inline.to_string());
         } else {
             kept.push(token.clone());
         }
     }
     Ok((kept, value))
+}
+
+fn validate_model_arg(model: &str) -> Result<()> {
+    let (provider, rest) = model.split_once('/').with_context(|| {
+        format!("invalid OpenCode model '{model}': expected provider/model[#variant]")
+    })?;
+    let (model_id, variant) = match rest.split_once('#') {
+        Some((id, variant)) => (id, Some(variant)),
+        None => (rest, None),
+    };
+    if provider.is_empty()
+        || provider.contains('#')
+        || model_id.is_empty()
+        || model.chars().any(char::is_whitespace)
+        || variant.is_some_and(|variant| variant.is_empty() || variant.contains('#'))
+    {
+        bail!("invalid OpenCode model '{model}': expected provider/model[#variant]");
+    }
+    Ok(())
 }
 
 /// The server flags the user chose (`--standalone`, `--server <url>`), if any.
@@ -300,8 +328,30 @@ mod tests {
         for args in [
             strings(&["--model", "--session", "ses_src"]),
             strings(&["--agent"]),
+            strings(&["--model="]),
+            strings(&["--agent="]),
+            strings(&["--model", ""]),
+            strings(&["--agent", " "]),
         ] {
             assert!(take_value_arg(&args, &["--model", "--agent"]).is_err());
+        }
+    }
+
+    #[test]
+    fn test_validate_model_arg() {
+        for model in ["opencode/big-pickle", "anthropic/claude-sonnet-4-6#fast"] {
+            assert!(validate_model_arg(model).is_ok());
+        }
+        for model in [
+            "invalid",
+            "/model",
+            "provider/",
+            "provider/model#",
+            "provider/model#a#b",
+            "provider#bad/model",
+            "provider/model name",
+        ] {
+            assert!(validate_model_arg(model).is_err());
         }
     }
 
